@@ -17,12 +17,12 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT, TA_JUSTIFY
 from reportlab.lib.units import inch
 from reportlab.graphics.shapes import Drawing
-from reportlab.graphics.charts.barcharts import VerticalBarChart
+from reportlab.graphics.charts.barcharts import VerticalBarChart, HorizontalBarChart
 from reportlab.graphics.charts.piecharts import Pie
 from reportlab.graphics.charts.legends import Legend
 
 
-from veracode_api_py import VeracodeAPI as vapi, Collections, Findings, Users
+from veracode_api_py import VeracodeAPI as vapi, Collections, Findings, Users, SummaryReport
 
 log = logging.getLogger(__name__)
 
@@ -156,6 +156,7 @@ def get_collection_information(collguid, scan_types, affects_policy):
     findings_list = get_findings(applications, scan_types, affects_policy)
     collection_info['collection_summary'] = findings_list.pop('collection_summary')
     collection_info['collection_policy_summary'] = findings_list.pop('collection_policy_summary')
+    collection_info['collection_SCA_summary'] = findings_list.pop('collection_SCA_summary')
     for asset in assets:
         guid = asset.get('guid')
         if guid in findings_list and 'asset_info' not in findings_list.get(guid):
@@ -177,8 +178,7 @@ def get_finding_severity(finding):
     return finding['finding_details']['severity']
 
 
-def get_app_profile_summary_data(app_findings):
-    app_summary_info = {}
+def get_app_profile_summary_data(app_findings, app_summary_info):
     allfindingsbysev = {}
     allfindingsbysev['sev5'] = []
     allfindingsbysev['sev4'] = []
@@ -218,6 +218,86 @@ def get_app_profile_summary_data(app_findings):
     return app_summary_info
 
 
+def summarize_sca_findings(app_summary_info):
+    vulnerabilitiesBySev = {}
+    vulnerabilitiesBySevViolatingPolicy = {}
+    licenseRisk = {}
+    componentsViolatingLicensePolicy = []
+    
+    for scaDTO in app_summary_info['software_composition_analysis']['vulnerable_components']['component_dto']:
+        if scaDTO['component_affects_policy_compliance'] == 'true':
+            for policyRule in scaDTO['violated_policy_rules']['policy_rule']:
+                if policyRule['type'] == 'Disallow Component by License Risk':
+                    componentsViolatingLicensePolicy.append(scaDTO)
+        for license in scaDTO['licenses']['license_dto']:
+            licenseRiskRating = get_license_risk(license)
+            if licenseRisk.get(licenseRiskRating) is None:
+                licenseRisk[licenseRiskRating] = {}
+            if licenseRisk[licenseRiskRating].get(license['spdx_id']) is None:
+                licenseRisk[licenseRiskRating][license['spdx_id']] = 0
+            licenseRisk[licenseRiskRating][license['spdx_id']] += 1
+        for vuln in scaDTO['vulnerabilities']['vulnerability_dto']: 
+            if vulnerabilitiesBySev.get(vuln['severity']) is None:
+                vulnerabilitiesBySev[vuln['severity']] = []
+            vulnerabilitiesBySev[vuln['severity']].append(vuln)
+            if vuln['vulnerability_affects_policy_compliance'] == 'true':
+                if vulnerabilitiesBySevViolatingPolicy.get(vuln['severity']) is None:
+                    vulnerabilitiesBySevViolatingPolicy[vuln['severity']] = []
+                vulnerabilitiesBySevViolatingPolicy[vuln['severity']].append(vuln)
+    app_summary_info['software_composition_analysis']['license_risk'] = licenseRisk
+    app_summary_info['software_composition_analysis']['library_violating_license_policy'] = componentsViolatingLicensePolicy
+    app_summary_info['software_composition_analysis']['findings_by_sev'] = vulnerabilitiesBySev
+    app_summary_info['software_composition_analysis']['findings_by_sev_violating_policy'] = vulnerabilitiesBySevViolatingPolicy
+    return app_summary_info
+
+
+def get_license_risk(license):
+    if license['risk_rating'] == '':
+        return 'unrecognized'
+    else:
+        return license['risk_rating']
+
+
+def update_collection_SCA_summary(collection_SCA_summary, app_findings):
+    if collection_SCA_summary.get('license_risk') is None:
+        collection_SCA_summary['license_risk'] = {}
+    clr = collection_SCA_summary['license_risk']
+    license_risk = app_findings['software_composition_analysis']['license_risk']
+    for risk_rating in license_risk:
+        if clr.get(risk_rating) is None: 
+            clr[risk_rating] = license_risk[risk_rating]
+        else:
+            for license in license_risk[risk_rating]:
+                clr[risk_rating][license] = clr[risk_rating].get(license, 0) + license_risk[risk_rating][license]
+
+    if collection_SCA_summary.get('library_violating_license_policy') is None:
+        collection_SCA_summary['library_violating_license_policy'] = {}
+    clvlp = collection_SCA_summary['library_violating_license_policy']
+    libraries_violating_license_policy = app_findings['software_composition_analysis']['library_violating_license_policy']
+    for lib in libraries_violating_license_policy:
+        comp_id = lib['component_id']
+        if clvlp.get(comp_id) is None: 
+            lib['instance_count'] = 1
+            clvlp[comp_id] = lib
+        else:
+            clvlp[comp_id]['instance_count'] = clvlp[comp_id]['instance_count'] + 1
+
+    if collection_SCA_summary.get('findings_by_sev') is None:
+        collection_SCA_summary['findings_by_sev'] = {}
+    cfbs = collection_SCA_summary['findings_by_sev']
+    findings_by_sev = app_findings['software_composition_analysis']['findings_by_sev']
+    for severity in findings_by_sev:
+        cfbs[severity] = cfbs.get(severity, 0) + len(findings_by_sev[severity])
+
+    if collection_SCA_summary.get('findings_by_sev_violating_policy') is None:
+        collection_SCA_summary['findings_by_sev_violating_policy'] = {}
+    cfbsvp = collection_SCA_summary['findings_by_sev_violating_policy']
+    findings_by_sev_vp = app_findings['software_composition_analysis']['findings_by_sev_violating_policy']
+    for severity in findings_by_sev_vp:
+        cfbsvp[severity] = cfbsvp.get(severity, 0) + len(findings_by_sev_vp[severity])
+    return collection_SCA_summary
+
+
 def update_collection_findings_by_sev(collection_summary, app_findings_summary):
     collection_summary['sev5'] = collection_summary.get('sev5', 0) + app_findings_summary['sev5']
     collection_summary['sev4'] = collection_summary.get('sev4', 0) + app_findings_summary['sev4']
@@ -234,6 +314,7 @@ def get_findings(apps, scan_types_requested, affects_policy):
     log.info(status)
     collection_all_findings_summary = {}
     collection_policy_summary = {}
+    collection_SCA_summary = {}
     all_findings = {}
     sca = False
     scan_types_to_get = list(scan_types_requested)
@@ -248,18 +329,25 @@ def get_findings(apps, scan_types_requested, affects_policy):
         this_app_SCA_findings = []
         log.debug("Getting findings for application {}".format(app))
         this_app_findings = Findings().get_findings(app, scan_types_to_get, True, params)  # update to do by severity and policy status
+        this_app_summary = {}
         # SCA findings call must be made by itself currently. See official docs: https://docs.veracode.com/r/c_findings_v2_intro
         if sca:
             this_app_SCA_findings = Findings().get_findings(app, 'SCA', True)  # API does not accept violates_policy request parameter
         if len(this_app_SCA_findings) > 0:
             this_app_findings = this_app_findings + this_app_SCA_findings
-        this_app_findings = get_app_profile_summary_data(this_app_findings)
+        if len(this_app_findings) > 0:
+            this_app_summary = SummaryReport().get_summary_report(app)
+        this_app_findings = get_app_profile_summary_data(this_app_findings, this_app_summary)
+        if this_app_findings.get('software_composition_analysis') is not None:
+            this_app_findings = summarize_sca_findings(this_app_findings)
+            collection_SCA_summary = update_collection_SCA_summary(collection_SCA_summary, this_app_findings)
         collection_all_findings_summary = update_collection_findings_by_sev(collection_all_findings_summary, this_app_findings['findings_by_severity'])
         collection_policy_summary = update_collection_findings_by_sev(collection_policy_summary, this_app_findings['policy_findings_by_severity'])
         all_findings[app] = this_app_findings
 
     all_findings['collection_summary'] = collection_all_findings_summary
     all_findings['collection_policy_summary'] = collection_policy_summary
+    all_findings['collection_SCA_summary'] = collection_SCA_summary
     return all_findings
 
 # ******************************* #
@@ -334,6 +422,8 @@ def executive_summary_page(Story, collection_info):
     policyfindingsbysev = collection_info['collection_policy_summary']
 
     compliance_overview = collection_info.get('compliance_overview')
+
+    sca_summary = collection_info['collection_summary']
 
     ## Executive Summary Title
     sectionTitle = Paragraph("Executive Summary", styles["h1b"])
@@ -417,7 +507,7 @@ def executive_summary_page(Story, collection_info):
     tLayoutStyle = TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE")])
     summaryLayoutTable.setStyle(tLayoutStyle)
     Story.append(summaryLayoutTable)
-    Story.append(spacer)
+    # Story.append(spacer)
 
     ## Overview Charts
     wrappperTableData = []
@@ -426,12 +516,46 @@ def executive_summary_page(Story, collection_info):
     openFindingsPolicyTable = findings_summary_chart(policyfindingsbysev)
     wrappperTableData.append([complianceSummaryPieChart, openFindingsPolicyTable])
 
+    scaSummaryBarChart = sca_findings_chart(sca_summary)
+
+    wrappperTableData.append([scaSummaryBarChart, ''])
+
     wrapperTable = Table(wrappperTableData, [0.5 * printable_width, 0.5 * printable_width], 0.7 * printable_width)
     wrapperTableStyle = TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP")])
     wrapperTable.setStyle(wrapperTableStyle)
-    wrapperTable.hAlign = 'LEFT'
+    # wrapperTable.hAlign = 'LEFT'
     Story.append(wrapperTable)
     Story.append(PageBreak())
+
+
+def sca_findings_chart(sca_findings):
+    sca_summary_data = [
+        (
+            (sca_findings["sev5"]),
+            (sca_findings["sev4"]),
+            (sca_findings["sev3"]),
+            (sca_findings["sev2"]),
+            (sca_findings["sev1"]),
+            (sca_findings["sev0"]),
+        )
+    ]
+
+    d = Drawing(0.4 * printable_width, 0.35 * printable_width)
+    bc = HorizontalBarChart()
+    bc.x = 0
+    bc.y = 0.08 * printable_width
+    bc.width = 0.4 * printable_width
+    bc.height = 0.27 * printable_width
+
+    bc.data = sca_summary_data
+    bc.categoryAxis.style = "stacked"
+
+    d.add(bc)
+
+    tableTitle = Paragraph('SCA Findings Summary', styles['h3'])
+    wrappingTable = summary_table_wrap(d, tableTitle)
+
+    return wrappingTable
 
 
 def compliance_summary_pie_chart(compliance_overview):
@@ -1292,12 +1416,12 @@ def main():
     status = "Getting asset data for collection {}...".format(collguid)
     log.info(status)
     print(status)
-    collection_info = get_collection_information(collguid, scan_types, affects_policy)
+    # collection_info = get_collection_information(collguid, scan_types, affects_policy)
 
     # Opening JSON file - Use for local testing to skip api calls
-    # with open('sample_collection.json', 'r') as openfile:
-    #     # Reading from json file
-    #     collection_info = json.load(openfile)
+    with open('sample_collection.json', 'r') as openfile:
+        # Reading from json file
+        collection_info = json.load(openfile)
 
     global collection_name
     collection_name = collection_info.get('name')
