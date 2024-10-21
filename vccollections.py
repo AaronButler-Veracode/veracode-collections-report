@@ -328,7 +328,7 @@ def get_findings(apps, scan_types_requested, affects_policy):
     for app in apps:
         this_app_SCA_findings = []
         log.debug("Getting findings for application {}".format(app))
-        this_app_findings = Findings().get_findings(app, scan_types_to_get, True, params)  # update to do by severity and policy status
+        this_app_findings = Findings().get_findings(app, ','.join(scan_types_to_get), True, params)  # update to do by severity and policy status
         this_app_summary = {}
         # SCA findings call must be made by itself currently. See official docs: https://docs.veracode.com/r/c_findings_v2_intro
         if sca:
@@ -927,27 +927,51 @@ def profile_details_section(Story, profile):
         Story.append(sectionTitle)
         Story.append(Spacer(1, .25*inch))
         findingsTableArray = {}
+        findingsAndRecommendationsArray = {}
         for f in findings:
             scan_type = f['scan_type']
-            data_row = []
-            if (findingsTableArray.get(scan_type) is None):
-                findingsTableArray[scan_type] = []
-            match scan_type:
-                case "STATIC":
-                    data_row = static_findings_data_row(f)
-                case 'DYNAMIC':
-                    data_row = dyanmic_findings_data_row(f)
-                case 'SCA':
-                    data_row = sca_findings_data_row(f)
-                case 'MANUAL':
-                    data_row = manual_findings_data_row(f)
-            if len(data_row) > 0:
-                findingsTableArray[scan_type].append(data_row)
-        for scan_type in findingsTableArray:
-            if (len(findingsTableArray[scan_type]) > 1):
-                findingTable = findings_table_generation(findingsTableArray[scan_type], scan_type)
-                Story.append(findingTable)
-                Story.append(Spacer(1, .25*inch))
+            # data_row = []
+            # if (findingsTableArray.get(scan_type) is None):
+            #     findingsTableArray[scan_type] = []
+            # match scan_type:
+            #     case "STATIC":
+            #         data_row = static_findings_data_row(f)
+            #     case 'DYNAMIC':
+            #         data_row = dyanmic_findings_data_row(f)
+            #     case 'SCA':
+            #         data_row = sca_findings_data_row(f)
+            #     case 'MANUAL':
+            #         data_row = manual_findings_data_row(f)
+            # if len(data_row) > 0:
+            #     findingsTableArray[scan_type].append(data_row)
+
+            fd = f['finding_details']
+            severity = 'sev'+str(fd['severity'])
+            severityArray = findingsAndRecommendationsArray.get(severity, {})
+            cweObj = fd['cwe']
+            cweArray = severityArray.get(cweObj['id'], {})
+            if len(cweArray) == 0: 
+                cweArray = cweObj
+                cweInfo = Findings().get_cwe(cweObj['id'])
+                cweArray['description'] = cweInfo['description']
+                cweArray['remediation_effort'] = cweInfo['remediation_effort']
+                cweArray['recommendation'] = cweInfo['recommendation']
+                cweArray['findingList'] = {}
+            if len(cweArray['findingList'].get(scan_type, [])) == 0:
+                cweArray['findingList'][scan_type] = []
+            cweArray["findingList"][scan_type].append(
+                {"issue_id": f["issue_id"], "finding_details": f["finding_details"]}
+            )
+            severityArray[cweArray['id']] = cweArray
+            findingsAndRecommendationsArray[severity] = severityArray
+        findingsAndRecommendationsTable = findings_detailed_generation(findingsAndRecommendationsArray)
+
+        # for scan_type in findingsTableArray:
+        #     if (len(findingsTableArray[scan_type]) > 1):
+        #         findingTable = findings_table_generation(findingsTableArray[scan_type], scan_type)
+        #         Story.append(findingTable)
+        #         Story.append(Spacer(1, .25*inch))
+        
         Story.append(Spacer(1, .25*inch))
 
 
@@ -1175,6 +1199,11 @@ def findings_table_generation(findingTableData, scan_type):
     )
     return findingTable
 
+def findings_detailed_generation(findingTableData):
+    tableTitle = Paragraph('Findings and Recommendations', styles['h4'])
+    finding_catagories = {}
+    for finding in findingTableData:
+        finding_catagories
 
 def _header(canvas, doc, content):
     # Header
@@ -1416,12 +1445,12 @@ def main():
     status = "Getting asset data for collection {}...".format(collguid)
     log.info(status)
     print(status)
-    # collection_info = get_collection_information(collguid, scan_types, affects_policy)
+    collection_info = get_collection_information(collguid, scan_types, affects_policy)
 
     # Opening JSON file - Use for local testing to skip api calls
-    with open('sample_collection.json', 'r') as openfile:
-        # Reading from json file
-        collection_info = json.load(openfile)
+    # with open('sample_collection.json', 'r') as openfile:
+    #     # Reading from json file
+    #     collection_info = json.load(openfile)
 
     global collection_name
     collection_name = collection_info.get('name')
